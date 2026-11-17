@@ -215,7 +215,6 @@ function startHeartbeat() {
       }
       // Keeps the MV3 service worker alive AND detects a half-open socket.
       send({ type: "ping" }).catch(() => {});
-      refreshStudioStatus();
     }
   }, HEARTBEAT_MS);
 }
@@ -286,22 +285,10 @@ async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
   });
 }
 
-// Ask the bridge whether a Roblox Studio instance is actually connected to the
-// MCP server. Broadcasts only on change so the UI updates promptly but quietly.
+// studio_status probe removed for Pi Agent Connector (Roblox-only)
 let studioProbing = false;
 async function refreshStudioStatus() {
-  if (studioProbing || !connected) return;
-  studioProbing = true;
-  try {
-    const r = await send({ type: "studio_status" }, 12000);
-    const v = r && r.ok && typeof r.studio === "boolean" ? r.studio : null;
-    if (v !== studioConnected) {
-      studioConnected = v;
-      broadcastStatus();
-    }
-  } finally {
-    studioProbing = false;
-  }
+  return;
 }
 
 function handleBridgeMessage(msg) {
@@ -361,26 +348,58 @@ function handleBridgeMessage(msg) {
     return;
   }
   if (msg.type === "remote_prompt") {
-    // Pi-initiated prompt: find active supported AI chat tab and send prompt into it
-    chrome.tabs.query({}, (tabs) => {
-      const match = (tabs || []).find((t) => t.url && PROVIDER_URLS.some((pattern) => {
+    // Pi-initiated prompt: route to active supported non-discarded tab and handle delivery failures
+    const selectAndSend = (tabs, preferredWindowId) => {
+      const isSupported = (t) => t && t.id && t.url && PROVIDER_URLS.some((pattern) => {
         const regex = new RegExp("^" + pattern.replace(/\*/g, ".*"));
         return regex.test(t.url);
-      }));
-      if (!match || !match.id) {
+      });
+      const activeSupported = (tabs || []).filter((t) => t.active && !t.discarded && isSupported(t));
+      const target = activeSupported.find((t) => t.windowId === preferredWindowId) || activeSupported[0];
+
+      if (!target || !target.id) {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: "remote_prompt_result",
             id: msg.id,
-            error: "No active AI chat tab open in browser (ChatGPT, Claude, Gemini, etc.)",
+            error: "No active supported AI chat tab open in browser (ChatGPT, Claude, Gemini, etc.)",
           }));
         }
         return;
       }
-      chrome.tabs.sendMessage(match.id, {
+
+      chrome.tabs.sendMessage(target.id, {
         type: "zs_remote_prompt",
         id: msg.id,
         text: msg.text,
+      }, () => {
+        if (chrome.runtime.lastError) {
+          const err = chrome.runtime.lastError.message || "Failed to communicate with tab content script";
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "remote_prompt_result",
+              id: msg.id,
+              error: `Error communicating with active AI chat tab: ${err}`,
+            }));
+          }
+        }
+      });
+    };
+
+    chrome.windows.getLastFocused((window) => {
+      const preferredWindowId = window && window.id;
+      if (chrome.runtime.lastError || preferredWindowId == null) {
+        // Fallback is deliberately limited to an active supported tab in any window.
+        chrome.tabs.query({ active: true }, (tabs) => selectAndSend(tabs, null));
+        return;
+      }
+      chrome.tabs.query({ active: true, windowId: preferredWindowId }, (tabs) => {
+        if ((tabs || []).some((t) => t.active && !t.discarded && t.url && PROVIDER_URLS.some((pattern) => new RegExp("^" + pattern.replace(/\*/g, ".*")).test(t.url)))) {
+          selectAndSend(tabs, preferredWindowId);
+        } else {
+          // No supported active tab in the last-focused window: try active tabs elsewhere.
+          chrome.tabs.query({ active: true }, (fallbackTabs) => selectAndSend(fallbackTabs, null));
+        }
       });
     });
     return;

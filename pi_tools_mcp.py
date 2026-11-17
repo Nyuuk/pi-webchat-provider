@@ -39,10 +39,16 @@ ROOT_DIR = Path(os.environ.get("PI_WORKSPACE_ROOT", os.getcwd())).resolve()
 
 
 def _resolve_path(rel_or_abs: str) -> Path:
+    """Resolve a path and refuse to escape the configured workspace."""
     p = Path(rel_or_abs.strip() or ".")
     if not p.is_absolute():
         p = ROOT_DIR / p
-    return p.resolve()
+    target = p.resolve()
+    try:
+        target.relative_to(ROOT_DIR)
+    except ValueError as error:
+        raise ValueError(f"Path escapes workspace root: {rel_or_abs}") from error
+    return target
 
 
 def _relative(p: Path) -> str:
@@ -95,6 +101,8 @@ def tool_read(path: str, offset: int = 1, limit: int = 2000) -> str:
 
     total_lines = len(lines)
     start_idx = offset - 1
+    if start_idx >= total_lines:
+        return f"File has {total_lines} lines; offset {offset} is past the end."
     end_idx = min(start_idx + limit, total_lines)
 
     selected = lines[start_idx:end_idx]
@@ -401,6 +409,9 @@ def main():
                 continue
             msg = json.loads(line)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(msg, dict):
             continue
 
         req_id = msg.get("id")

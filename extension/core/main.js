@@ -139,7 +139,7 @@
     return backgroundSessions;
   }
 
-  let selectedTargetId = "vscode";
+  let selectedTargetId = "pi-agent";
   try {
     chrome.storage.local.get(TARGET_STORAGE_KEY, (result) => {
       const saved = result && result[TARGET_STORAGE_KEY];
@@ -184,6 +184,9 @@
 
   const A = {
     running: false,
+    // A Pi remote prompt owns the page composer and response stream just like
+    // the normal agent loop. Reserve it synchronously before any async work.
+    remotePromptRunning: false,
     stop: false,
     // stopping: the user clicked Stop and we are winding the loop down. Set the
     // instant the button is clicked so the bar can show immediate "Stopping…"
@@ -425,7 +428,7 @@
       // During Starting Up / the agent loop, the bootstrap or loop owns the cover
       // for the whole phase, so don't lift it here between an injection and the
       // next waitForResponse - it stays up until the loop / bootstrap ends.
-      if (!A.starting && !A.running) ui.inputCover(false);
+      if (!A.starting && !A.running && !A.remotePromptRunning) ui.inputCover(false);
       setTimeout(() => (A.injecting = false), 400);
       // Camouflage the turn we just injected without waiting on the rAF observer
       // (paused in a background tab). A couple of nudges cover the render.
@@ -988,7 +991,7 @@
 
   function activeTools() {
     if (!isMcpEnabled(selectedTargetId)) return [];
-    return A.toolList.filter((tool) => (tool.server || "roblox") === selectedTargetId);
+    return A.toolList.filter((tool) => (tool.server || "pi-agent") === selectedTargetId);
   }
 
   function refreshActiveToolNames() {
@@ -1078,7 +1081,7 @@
         diag("bridge.preflightFail", { name, kind: (probe && probe.kind) || "none" });
         A._bridgeProbeOkAt = 0;
         ui.banner("warn", "Bridge offline",
-          "snapgentV3 bridge is unreachable - start it and keep the selected target app open.");
+          "Pi Agent Connector bridge is unreachable - start it and keep the bridge running.");
         return ZS.FEEDBACK.bridgeOffline;
       }
       A._bridgeProbeOkAt = Date.now();
@@ -1107,7 +1110,7 @@
       }
       return `ERROR: the '${bareName}' command timed out and is unavailable in this environment. Do NOT call it again - complete the task yourself using the other commands (execute_luau, multi_edit, etc.).`;
     }
-    // Virtual command: list the MCP server(s) snapgentV3 is currently connected
+    // Virtual command: list the MCP server(s) Pi Agent Connector is currently connected
     // to, with each one's REAL per-server health (from the bridge, never the
     // merged tool count - a dead server must not borrow another's numbers).
     if (name === "list_mcp_servers") {
@@ -1118,12 +1121,12 @@
         .filter((sv) => sv.id === selectedTargetId && isMcpEnabled(sv.id));
       const lines = servers.length
         ? servers.map((sv) => {
-            const label = sv.id === "vscode"
-              ? "VS Code (default target)"
-              : sv.id === "roblox" ? "Roblox Studio" : `${sv.id} (addon)`;
+            const label = sv.id === "pi-agent"
+              ? "Pi Agent (default target)"
+              : sv.id === "vscode" ? "VS Code" : sv.id === "roblox" ? "Roblox Studio" : `${sv.id} (addon)`;
             return `- ${sv.id}: ${label} - ${sv.alive ? `${sv.tools || 0} commands available` : "offline (no tools)"}`;
           })
-        : ["- vscode: VS Code (default target) - unknown (bridge did not report server health)"];
+        : ["- pi-agent: Pi Agent (default target) - unknown (bridge did not report server health)"];
       return (
         `Output of 'list_mcp_servers':\n` +
         `Connected MCP servers (${lines.length}):\n${lines.join("\n")}\n` +
@@ -1131,17 +1134,17 @@
       );
     }
     // Virtual command: list available commands with full details. Defaults to
-    // the primary Roblox server - a DIFFERENT server's tools only ever show up
+    // the primary Pi Agent server - a DIFFERENT server's tools only ever show up
     // if the model explicitly asks via {"server": "<id>"} (see list_mcp_servers).
     if (name === "list_commands" || name === "list_tools") {
       await ensureTools();
-      const target = (selectedTargetId || "vscode").trim();
+      const target = (selectedTargetId || "pi-agent").trim();
       const asked = typeof args.server === "string" ? args.server.trim() : "";
       // Isolation: only the server selected in the dropdown can be listed. A request
       // for any other server gets a generic refusal that does not reveal whether that
       // server exists, is connected, or is toggled on.
       if (asked && asked !== target) {
-        return `Output of '${name}':\nERROR: server "${asked}" is not available. Only the selected target "${target}" can be used in this session. Do NOT try other servers; ask the user to switch the target in the snapgentV3 selector if needed.`;
+        return `Output of '${name}':\nERROR: server "${asked}" is not available. Only the selected target "${target}" can be used in this session. Do NOT try other servers; ask the user to switch the target in the Pi Agent Connector selector if needed.`;
       }
       const requested = target;
       if (!isMcpEnabled(requested)) {
@@ -1161,7 +1164,7 @@
         const rbxUsable = !!s.connected && rbxAlive && s.studio !== false;
         if (!rbxUsable) {
           // Isolation: never reveal other servers here.
-          const otherStr = "Do NOT try other servers; wait for the user to fix the target or switch it in the snapgentV3 selector.";
+          const otherStr = "Do NOT try other servers; wait for the user to fix the target or switch it in the Pi Agent Connector selector.";
           return `Output of '${name}':\nRoblox Studio is currently OFFLINE (closed, no place open, or its MCP server disabled), so its commands cannot run. This is an environment problem on the user's machine, not your mistake. Tell the user in one short sentence to open their place in Roblox Studio and enable its MCP server. ${otherStr}`;
         }
       }
@@ -1169,10 +1172,10 @@
       // Tools from a bridge that doesn't tag "server" yet (old version) have no
       // .server field at all - treat those as the primary server rather than
       // hiding everything.
-      const scoped = A.toolList.filter((t) => (t.server || "roblox") === requested);
+      const scoped = A.toolList.filter((t) => (t.server || "pi-agent") === requested);
       if (!A.toolList.length) return `Output of '${name}':\nNo commands available - the bridge or selected MCP server may be offline.`;
       if (!scoped.length) {
-        return `Output of '${name}':\nERROR: the selected server "${requested}" has no commands available (it may be offline). Do NOT try other servers; tell the user to check the target in the snapgentV3 selector.`;
+        return `Output of '${name}':\nERROR: the selected server "${requested}" has no commands available (it may be offline). Do NOT try other servers; tell the user to check the target in the Pi Agent Connector selector.`;
       }
       const lines = scoped.map((t) => {
         const props = (t.inputSchema && t.inputSchema.properties) || {};
@@ -1492,7 +1495,7 @@
   //  AGENTIC LOOP
   // ════════════════════════════════════════════════════════════════════════
   async function agentLoop(base) {
-    if (A.running) return;
+    if (A.running || A.remotePromptRunning) return;
     A.running = true;
     A.resumeArmed = false; // loop now owns the turn; drop the regenerate grace
     A.stop = false;
@@ -1992,7 +1995,17 @@
     } catch { return false; }
   }
   function stopLoop() {
-    if (A.stopping) return; // already winding down - ignore double-clicks
+    if (A.remotePromptRunning) {
+      if (A.stopping) return;
+      A.stop = true;
+      A.userStopped = true;
+      A.resumeArmed = false;
+      A.stopAt = Date.now();
+      P.stopGeneration();
+      ui.markStopping();
+      ui.toast("Stopping remote prompt…");
+      return;
+    }
     diag("stopLoop");
     A.stop = true;
     A.stopping = true;
@@ -2349,10 +2362,10 @@
     const rider =
       "\n\n────────────────────────────────\n" +
       ZS.RESEND_MARKER + "\n" +
-      "(System note from snapgentV3 - an automatic re-statement of your operating " +
+      "(System note from Pi Agent Connector - an automatic re-statement of your operating " +
       "instructions, NOT a new request and NOT something to reply to. This conversation " +
       "may have been summarised, which drops the part explaining how you actually run " +
-      "commands. To be explicit: the snapgentV3 extension IS running in this page right " +
+      "commands. To be explicit: the Pi Agent Connector extension IS running in this page right " +
       "now, it DOES read your replies, and the commands below DO execute for real - the " +
       "results you have been receiving are proof of it. Keep using them exactly as " +
       "described. Just carry on with the task; do not acknowledge this note.)\n" +
@@ -2374,7 +2387,7 @@
   //  SESSION BOOTSTRAP  ("Starting Up" animated chip, shown in the conversation)
   // ════════════════════════════════════════════════════════════════════════
   async function startSession() {
-    if (A.running || A.starting) return;
+    if (A.running || A.starting || A.remotePromptRunning) return;
     // "Start session" is allowed ONLY on a blank conversation. Opening an
     // EXISTING conversation must never trigger the bootstrap.
     if (!P.chatIsEmpty() && !A.started) {
@@ -3366,6 +3379,7 @@
     }
 
     function getTargetName(id = selectedTargetId) {
+      if (id === "pi-agent") return "Pi Agent";
       if (id === "roblox") return "Roblox Studio";
       if (id === "vscode") return "VS Code";
       if (id === "effectcraft") return "EffectCraft";
@@ -3378,11 +3392,12 @@
     function setTarget(id = selectedTargetId) {
       if (!targetSelect) return;
       const options = [
+        { id: "pi-agent", name: "Pi Agent" },
         { id: "vscode", name: "VS Code" },
         { id: "roblox", name: "Roblox Studio" },
         { id: "effectcraft", name: "EffectCraft" },
         ...mergedMcpServers()
-          .filter((server) => !["vscode", "roblox", "effectcraft"].includes(server.id))
+          .filter((server) => !["pi-agent", "vscode", "roblox", "effectcraft"].includes(server.id))
           .map((server) => ({ id: server.id, name: getTargetName(server.id) })),
       ].filter((option) => isMcpEnabled(option.id));
       if (!options.some((option) => option.id === id)) {
@@ -4889,7 +4904,7 @@
     // EXCEPTION: a command parked by the hold (A.held) keeps the Stop control
     // visible - otherwise the suppression hides the only way to cancel it.
     ui.showStop((A.held || !scrollSuppressed()) &&
-      (A.running || A.toolRunning || A.stopping || (A.started && P.isHardGenerating())));
+      (A.running || A.remotePromptRunning || A.toolRunning || A.stopping || (A.started && P.isHardGenerating())));
 
     // Tool is executing on the MCP → timer on its chip.
     if (A.toolRunning && A.toolItem) {
@@ -4928,25 +4943,104 @@
     }
     if (msg && msg.type === "zs_remote_prompt") {
       (async () => {
-        try {
-          diag("remote_prompt.received", { id: msg.id, textLen: (msg.text || "").length });
-          const base = P.assistantCount();
-          await P.typeAndSend(msg.text);
-          const res = await waitForResponse(base);
-          const reply = (res && res.reply) || "";
-          diag("remote_prompt.finished", { id: msg.id, replyLen: reply.length });
+        // Do not type into or consume a conversation already owned by the user
+        // agent. Claim the page synchronously so a normal Start/loop cannot
+        // begin between this check and the first await below.
+        if (!A.started) {
           chrome.runtime.sendMessage({
             type: "zs_remote_prompt_result",
             id: msg.id,
-            reply: reply,
+            error: "Browser session is not initialized. Open a supported chat and click Start before sending prompts from Pi.",
           });
+          return;
+        }
+        if (A.running || A.starting || A.remotePromptRunning) {
+          chrome.runtime.sendMessage({
+            type: "zs_remote_prompt_result",
+            id: msg.id,
+            error: "Browser session is busy; finish or stop the active session, then retry the remote prompt.",
+          });
+          return;
+        }
+        A.remotePromptRunning = true;
+        A.stop = false; // Clear any stale stop-flag from a previous loop so the prompt is not immediately aborted.
+        try {
+          P.setInputLock(true);
+          ui.inputCover(true);
+          diag("remote_prompt.received", { id: msg.id, textLen: (msg.text || "").length });
+          const base = await submitAndGetBase(msg.text);
+          let responseBase = base;
+          let res;
+          // Reuse the same parser and selected-target runTool policy as the normal
+          // agent loop. Keep this bridge path bounded so a browser model cannot
+          // create an unending autonomous tool cycle.
+          for (let turn = 0; turn <= 20; turn++) {
+            res = await waitForResponse(responseBase);
+            if (res.kind !== "tool") break;
+            if (turn === 20) {
+              throw new Error("Browser response exceeded the 20-step tool limit");
+            }
+            if (!Array.isArray(res.calls) || res.calls.length !== 1) {
+              throw new Error("Browser response requested multiple tools; refusing ambiguous execution");
+            }
+            const call = res.calls[0];
+            const feedback = await runTool(call);
+            responseBase = await submitAndGetBase(feedback);
+          }
+          if (!res) {
+            throw new Error("No response returned from response watcher");
+          }
+          if (res.kind === "text") {
+            const reply = res.text || "";
+            diag("remote_prompt.finished", { id: msg.id, replyLen: reply.length });
+            chrome.runtime.sendMessage({
+              type: "zs_remote_prompt_result",
+              id: msg.id,
+              reply: reply,
+            });
+          } else if (res.kind === "truncated" && res.text) {
+            const reply = res.text;
+            diag("remote_prompt.finished", { id: msg.id, replyLen: reply.length, truncated: true });
+            chrome.runtime.sendMessage({
+              type: "zs_remote_prompt_result",
+              id: msg.id,
+              reply: reply,
+            });
+          } else {
+            let errorMsg = `Remote prompt failed (${res.kind})`;
+            if (res.kind === "timeout") {
+              errorMsg = "Timeout waiting for AI response";
+            } else if (res.kind === "empty" || res.kind === "fallback_turn") {
+              errorMsg = "Empty reply received from AI";
+            } else if (res.kind === "context_limit") {
+              errorMsg = `Context limit reached: ${res.detail || "conversation limit"}`;
+            } else if (res.kind === "too_long") {
+              errorMsg = "Conversation too long";
+            } else if (res.kind === "stopped") {
+              errorMsg = "Generation stopped by user";
+            } else if (res.kind === "parse_error") {
+              errorMsg = `Command parse error: ${res.reason || "malformed"}`;
+            }
+            diag("remote_prompt.error", { id: msg.id, kind: res.kind, error: errorMsg });
+            chrome.runtime.sendMessage({
+              type: "zs_remote_prompt_result",
+              id: msg.id,
+              error: errorMsg,
+            });
+          }
         } catch (err) {
           diag("remote_prompt.error", { id: msg.id, error: String(err) });
           chrome.runtime.sendMessage({
             type: "zs_remote_prompt_result",
             id: msg.id,
-            error: String(err),
+            error: String(err && err.message ? err.message : err),
           });
+        } finally {
+          A.remotePromptRunning = false;
+          A.stopping = false;
+          ui.showStop(false);
+          try { ui.inputCover(false); } catch (error) { console.warn("[Pi Agent Connector] Could not release remote prompt input cover:", error); }
+          try { P.setInputLock(false); } catch (error) { console.warn("[Pi Agent Connector] Could not release remote prompt input lock:", error); }
         }
       })();
     }
@@ -5163,7 +5257,7 @@
   // User-send interception: the provider wires the site's composer events to
   // these callbacks.
   P.installSendHooks({
-    isBlocked: () => A.injecting || A.running || A.starting,
+    isBlocked: () => A.injecting || A.running || A.starting || A.remotePromptRunning,
     isStarted: () => A.started,
     onBlockedAttempt: () => ui.nudgeStart(),
     onUserMessage: (base) => {

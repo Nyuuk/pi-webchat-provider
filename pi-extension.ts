@@ -1,98 +1,107 @@
 /**
- * Pi Agent Extension - Browser Bridge Integration
+ * Pi Agent Extension - Browser Bridge Model Provider
  *
- * Plugs into Pi Agent (@mariozechner/pi-coding-agent or @earendil-works/pi-coding-agent).
+ * Plugs into Pi Agent (@earendil-works/pi-coding-agent or @mariozechner/pi-coding-agent).
  *
- * Capabilities:
- *  1. Custom command: `/browser <prompt>`
- *     Sends a prompt from Pi terminal to the active AI chat in the browser,
- *     and prints the result back in Pi's terminal.
- *  2. Custom tool: `ask_browser`
- *     Allows Pi Agent to query the browser-based AI model during its own task.
+ * UX:
+ *  Registers Browser AI as a selectable model/provider in Pi Agent (`browser/browser-chat`).
+ *  Normal prompts in a Pi session route directly to the active web chat tab (ChatGPT,
+ *  Claude, Gemini, etc.) through the local Pi Bridge. No custom `/browser` prefix required.
  *
  * Install:
- *   Copy to ~/.pi/agent/extensions/browser-bridge.ts or .pi/extensions/browser-bridge.ts
+ *   mkdir -p ~/.pi/agent/extensions
+ *   cp pi-extension.ts ~/.pi/agent/extensions/browser-bridge.ts
+ *
+ * Usage:
+ *   pi --model browser/browser-chat
+ *   or switch model inside an active session via `/model browser/browser-chat`.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const BRIDGE_HTTP_URL = process.env.PI_HTTP_URL || "http://127.0.0.1:17614/prompt";
-
-async function queryBrowserAI(prompt: string, timeoutMs: number = 300000): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(BRIDGE_HTTP_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, timeout: Math.floor(timeoutMs / 1000) }),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Bridge returned HTTP ${res.status}: ${err}`);
-    }
-    const data = await res.json();
-    if (!data.ok) {
-      throw new Error(data.error || "Unknown error from bridge");
-    }
-    return data.reply || "(no response)";
-  } finally {
-    clearTimeout(timer);
-  }
+interface ModelInfo {
+  id: string;
+  name?: string;
+  context_window?: number;
+  max_tokens?: number;
 }
 
-export default function (pi: ExtensionAPI) {
-  // Register /browser command for the user in Pi's terminal
-  pi.registerCommand("browser", {
-    description: "Send a prompt to the active Browser AI chat (ChatGPT, Claude, etc.)",
-    handler: async (args, ctx) => {
-      const prompt = (args || "").trim();
-      if (!prompt) {
-        ctx.ui.notify("Usage: /browser <prompt text>", "warning");
-        return;
-      }
-      ctx.ui.notify("Sending prompt to browser AI...", "info");
-      try {
-        const reply = await queryBrowserAI(prompt);
-        ctx.ui.notify("Received reply from browser AI", "success");
-        // Print reply in terminal or send into session
-        pi.sendUserMessage(`[Browser AI Reply]:\n${reply}`, { deliverAs: "followUp" });
-      } catch (err: any) {
-        ctx.ui.notify(`Failed: ${err.message}`, "error");
-      }
+interface ModelsResponse {
+  data?: ModelInfo[];
+}
+
+export default async function (pi: ExtensionAPI) {
+  const host = process.env.PI_BRIDGE_HOST || "127.0.0.1";
+  const port = process.env.PI_HTTP_PORT || "17614";
+  const baseUrl = process.env.PI_BRIDGE_BASE_URL || `http://${host}:${port}/v1`;
+
+  const fallbackModels = [
+    {
+      id: "browser-chat",
+      name: "Browser Chat (Active Tab)",
+      reasoning: false,
+      input: ["text"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 4096,
     },
+  ];
+
+  let models = fallbackModels;
+
+  // Attempt dynamic discovery from bridge if available at startup
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const res = await fetch(`${baseUrl}/models`, { signal: controller.signal });
+      if (res.ok) {
+        const payload = (await res.json()) as ModelsResponse;
+        if (Array.isArray(payload?.data) && payload.data.length > 0) {
+          models = payload.data.map((m) => ({
+            id: m.id,
+            name: m.name ?? (m.id === "browser-chat" ? "Browser Chat (Active Tab)" : m.id),
+            reasoning: false,
+            input: ["text"] as ("text" | "image")[],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: m.context_window ?? 128000,
+            maxTokens: m.max_tokens ?? 4096,
+          }));
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    // If bridge is not running yet during startup, fallback to default model
+    models = fallbackModels;
+  }
+
+  // Register browser AI provider
+  pi.registerProvider("browser", {
+    name: "Browser AI",
+    baseUrl,
+    apiKey: "browser-ai",
+    api: "openai-completions",
+    models,
   });
 
-  // Register custom tool for Pi Agent LLM to use
-  pi.registerTool({
-    name: "ask_browser",
-    label: "Ask Browser AI",
-    description: "Query the active Browser AI chat (Claude, ChatGPT, Gemini) for assistance or analysis.",
-    promptSnippet: "Ask the browser-connected AI chatbot for assistance or code review",
-    promptGuidelines: [
-      "Use ask_browser when you want to consult the browser-based AI model (e.g. Claude or ChatGPT) for second opinions or complex explanations."
-    ],
-    parameters: Type.Object({
-      prompt: Type.String({ description: "Question or instruction for the browser AI" }),
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      onUpdate?.({
-        content: [{ type: "text", text: "Waiting for browser AI response..." }],
-      });
-      try {
-        const reply = await queryBrowserAI(params.prompt);
-        return {
-          content: [{ type: "text", text: reply }],
-          details: { reply },
-        };
-      } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Error contacting browser AI: ${err.message}` }],
-          isError: true,
-        };
-      }
-    },
+  // Notify user when browser model is selected
+  pi.on("model_select", async (event, ctx) => {
+    if (event.model.provider === "browser") {
+      ctx.ui.notify(
+        `Selected Browser AI model (${event.model.id}). Normal prompts route to active browser chat tab.`,
+        "info"
+      );
+    }
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (ctx.model?.provider === "browser") {
+      ctx.ui.notify(
+        `Browser AI model active (${ctx.model.id}). Normal prompts route to active browser chat tab.`,
+        "info"
+      );
+    }
   });
 }

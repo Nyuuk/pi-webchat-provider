@@ -1,0 +1,10 @@
+{
+  "name": "pi-webchat-provider",
+  "version": "0.1.0",
+  "description": "Browser AI model provider and local bridge for Pi Agent",
+  "license": "GPL-3.0-or-later",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./pi-extension.ts"]
+  }
+}

@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -69,6 +70,7 @@ class MCPServerProcess:
         self._pending: Dict[int, asyncio.Future] = {}
         self._lock = asyncio.Lock()
         self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self.ready = False
 
     @property
@@ -94,7 +96,7 @@ class MCPServerProcess:
             return False
 
         self._reader_task = asyncio.create_task(self._read_stdout())
-        asyncio.create_task(self._read_stderr())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
 
         try:
             await self._request("initialize", {
@@ -118,8 +120,14 @@ class MCPServerProcess:
 
     async def stop(self) -> None:
         self.ready = False
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
+        tasks = [task for task in (self._reader_task, self._stderr_task) if task]
+        self._reader_task = None
+        self._stderr_task = None
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(RuntimeError(f"Server {self.server_id} stopped"))
@@ -204,9 +212,10 @@ class MCPServerProcess:
 class PiBridge:
     def __init__(self):
         self.mcp_servers: Dict[str, MCPServerProcess] = {}
-        self.clients: Set[Any] = set()
+        self.clients: Dict[Any, float] = {}  # websocket -> connected_at
         self.client_lock = asyncio.Lock()
         self.pending_remote_prompts: Dict[str, asyncio.Future] = {}
+        self.remote_prompt_lock = asyncio.Lock()
 
     def get_catalog(self) -> List[Dict[str, Any]]:
         catalog = []
@@ -235,7 +244,7 @@ class PiBridge:
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         async with self.client_lock:
-            clients = list(self.clients)
+            clients = list(self.clients.keys())
         if not clients:
             return
         payload = json.dumps(message, ensure_ascii=False)
@@ -247,7 +256,7 @@ class PiBridge:
 
     async def handle_ws_client(self, websocket: Any, path: Optional[str] = None) -> None:
         async with self.client_lock:
-            self.clients.add(websocket)
+            self.clients[websocket] = time.time()
         log("Browser extension connected")
         try:
             await websocket.send(json.dumps(self.connected_message(), ensure_ascii=False))
@@ -264,6 +273,9 @@ class PiBridge:
 
                 if req_type == "ping":
                     await websocket.send(json.dumps({"type": "pong", "id": req_id}))
+                elif req_type == "studio_status":
+                    # Handle gracefully for compatibility
+                    await websocket.send(json.dumps({"type": "studio_status", "id": req_id, "ok": True, "studio": False}))
                 elif req_type == "list_tools":
                     msg = self.connected_message()
                     msg["type"] = "tools"
@@ -294,7 +306,7 @@ class PiBridge:
                     }, ensure_ascii=False))
         finally:
             async with self.client_lock:
-                self.clients.discard(websocket)
+                self.clients.pop(websocket, None)
             log("Browser extension disconnected")
 
     async def _handle_call_tool(self, websocket: Any, req: Dict[str, Any]) -> None:
@@ -304,31 +316,58 @@ class PiBridge:
         timeout_ms = req.get("timeout", 120000)
         timeout = max(1.0, min(float(timeout_ms) / 1000.0, 600.0))
 
-        # Find which server hosts this tool
+        server_id = req.get("server")
+        candidates = [
+            server for server in self.mcp_servers.values()
+            if server.alive and any(tool["name"] == name for tool in server.tools)
+        ]
         target_server = None
-        for s in self.mcp_servers.values():
-            if s.alive and any(t["name"] == name for t in s.tools):
-                target_server = s
-                break
+        if server_id:
+            target_server = self.mcp_servers.get(server_id)
+            if not target_server or not target_server.alive or not any(tool["name"] == name for tool in target_server.tools):
+                target_server = None
+        elif len(candidates) == 1:
+            target_server = candidates[0]
 
         if not target_server:
+            reason = "unknown_tool" if not candidates else "ambiguous_tool"
+            message = (
+                f"Tool '{name}' not found on any active MCP server."
+                if not candidates else
+                f"Tool '{name}' is available on multiple MCP servers; specify a server."
+            )
             resp = {
                 "type": "tool_result",
                 "id": req_id,
                 "ok": False,
-                "kind": "unknown_tool",
-                "error": f"Tool '{name}' not found on any active MCP server.",
+                "kind": reason,
+                "error": message,
             }
             await websocket.send(json.dumps(resp, ensure_ascii=False))
             return
 
         try:
             result = await target_server.call_tool(name, arguments, timeout=timeout)
+            content = result.get("content", []) if isinstance(result, dict) else []
+            text = "\n".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+            images = [
+                item
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "image"
+            ]
+            is_error = bool(result.get("isError")) if isinstance(result, dict) else False
             resp = {
                 "type": "tool_result",
                 "id": req_id,
-                "ok": True,
-                "result": result,
+                "ok": not is_error,
+                "text": text,
+                "images": images,
+                "kind": "tool_error" if is_error else None,
+                "error": text if is_error else None,
             }
         except Exception as e:
             resp = {
@@ -342,34 +381,34 @@ class PiBridge:
 
     async def send_remote_prompt(self, prompt: str, timeout: float = 300.0) -> str:
         """Sends a prompt from Pi host into the browser AI chat and waits for final reply."""
-        async with self.client_lock:
-            clients = list(self.clients)
-        if not clients:
-            raise RuntimeError("No browser extension is currently connected. Open a supported AI chat tab.")
+        async with self.remote_prompt_lock:
+            async with self.client_lock:
+                clients = list(self.clients.keys())
+            if not clients:
+                raise RuntimeError("No browser extension is currently connected. Open a supported AI chat tab.")
 
-        req_id = f"prompt_{int(asyncio.get_running_loop().time() * 1000)}_{uuid.uuid4().hex[:6]}"
-        fut = asyncio.get_running_loop().create_future()
-        self.pending_remote_prompts[req_id] = fut
+            # Deterministic single-client routing: route to the most recently connected client
+            if len(clients) > 1:
+                log(f"[remote_prompt] Warning: Ambiguity detected with {len(clients)} connected extension clients. Routing prompt to the most recently connected client to avoid double-submit.")
 
-        msg = {
-            "type": "remote_prompt",
-            "id": req_id,
-            "text": prompt,
-        }
-        payload = json.dumps(msg, ensure_ascii=False)
-
-        # Broadcast to connected browser extensions
-        for client in clients:
+            target_client = clients[-1]
+            req_id = f"prompt_{int(asyncio.get_running_loop().time() * 1000)}_{uuid.uuid4().hex[:6]}"
+            fut = asyncio.get_running_loop().create_future()
+            self.pending_remote_prompts[req_id] = fut
+            msg = {"type": "remote_prompt", "id": req_id, "text": prompt}
+            payload = json.dumps(msg, ensure_ascii=False)
             try:
-                await client.send(payload)
-            except Exception:
-                pass
-
-        try:
-            reply = await asyncio.wait_for(fut, timeout=timeout)
-            return reply
-        finally:
-            self.pending_remote_prompts.pop(req_id, None)
+                await target_client.send(payload)
+                try:
+                    return await asyncio.wait_for(fut, timeout=timeout)
+                except asyncio.TimeoutError as e:
+                    raise RuntimeError("Timed out waiting for browser AI response") from e
+            except Exception as e:
+                if isinstance(e, RuntimeError) and str(e) == "Timed out waiting for browser AI response":
+                    raise
+                raise RuntimeError(f"Failed to send remote prompt to browser extension: {e}") from e
+            finally:
+                self.pending_remote_prompts.pop(req_id, None)
 
     async def start_servers(self) -> None:
         config = self._load_config()
@@ -385,9 +424,22 @@ class PiBridge:
 
         for sid, scfg in servers.items():
             cmd = scfg.get("command")
+            if not isinstance(cmd, str) or not cmd.strip():
+                log(f"Skipping MCP server '{sid}': missing command")
+                continue
             args = scfg.get("args", [])
+            if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+                log(f"Skipping MCP server '{sid}': args must be a list of strings")
+                continue
             env = os.environ.copy()
-            env.update(scfg.get("env", {}))
+            configured_env = scfg.get("env", {})
+            if not isinstance(configured_env, dict):
+                log(f"Skipping MCP server '{sid}': env must be an object")
+                continue
+            env.update({str(key): str(value) for key, value in configured_env.items()})
+            # Keep the MCP process on the same interpreter environment as bridge.
+            if cmd == "python3":
+                cmd = sys.executable
             proc = MCPServerProcess(sid, cmd, args, cwd=ROOT, env=env)
             self.mcp_servers[sid] = proc
             await proc.start()
@@ -422,37 +474,47 @@ class SimpleHttpServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            header_lines = []
-            while True:
-                line = await reader.readline()
-                if not line or line == b"\r\n" or line == b"\n":
-                    break
-                header_lines.append(line.decode("utf-8", errors="replace").strip())
-
-            if not header_lines:
-                writer.close()
-                await writer.wait_closed()
+            header_blob = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+            if len(header_blob) > 16384:
+                self._write_json(writer, 400, {"error": "HTTP headers too large"})
                 return
-
+            header_lines = header_blob.decode("utf-8", errors="replace").split("\r\n")
             req_line = header_lines[0]
             parts = req_line.split()
             method = parts[0] if parts else "GET"
             path = parts[1] if len(parts) > 1 else "/"
 
-            # Extract Content-Length
             content_length = 0
+            headers = {}
             for h in header_lines[1:]:
-                if h.lower().startswith("content-length:"):
-                    try:
-                        content_length = int(h.split(":", 1)[1].strip())
-                    except ValueError:
-                        pass
+                if ":" in h:
+                    key, value = h.split(":", 1)
+                    key = key.strip().lower()
+                    if key in headers and key in ("content-length", "transfer-encoding"):
+                        self._write_json(writer, 400, {"error": f"Duplicate {key} header"})
+                        return
+                    headers[key] = value.strip()
+            if "content-length" in headers:
+                try:
+                    content_length = int(headers["content-length"])
+                except ValueError:
+                    self._write_json(writer, 400, {"error": "Invalid Content-Length"})
+                    return
+            if content_length < 0 or content_length > 8 * 1024 * 1024:
+                self._write_json(writer, 413, {"error": "Request body too large"})
+                return
+            if "transfer-encoding" in headers:
+                self._write_json(writer, 400, {"error": "Transfer-Encoding request bodies are not supported"})
+                return
 
-            body = b""
-            if content_length > 0:
-                body = await reader.readexactly(content_length)
-
+            body = await asyncio.wait_for(reader.readexactly(content_length), timeout=15) if content_length else b""
             await self._route(method, path, body, writer)
+        except asyncio.IncompleteReadError:
+            self._write_json(writer, 400, {"error": "Incomplete HTTP request body"})
+        except asyncio.LimitOverrunError:
+            self._write_json(writer, 400, {"error": "HTTP headers too large"})
+        except asyncio.TimeoutError:
+            self._write_json(writer, 408, {"error": "HTTP request timed out"})
         except Exception as e:
             self._write_json(writer, 500, {"error": str(e)})
         finally:
@@ -462,7 +524,81 @@ class SimpleHttpServer:
             except Exception:
                 pass
 
+    def _extract_prompt_text(self, messages: List[Dict[str, Any]]) -> str:
+        """Keep only the newest user turn and subsequent assistant/tool context."""
+        if not messages:
+            return ""
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        candidates = messages[last_user_idx:] if last_user_idx is not None else messages[-1:]
+        parts = []
+        for msg in candidates:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                sub = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            sub.append(item.get("text", ""))
+                        elif item.get("type") == "image_url":
+                            sub.append(f"[Image: {item.get('image_url', {}).get('url', '')}]")
+                    elif isinstance(item, str):
+                        sub.append(item)
+                text = " ".join(sub)
+            elif content is not None:
+                text = str(content)
+
+            text = text.strip()
+            if role == "tool":
+                tool_name = msg.get("name") or msg.get("tool_call_id") or "tool"
+                if text:
+                    parts.append(f"[Tool Output ({tool_name})]:\n{text}")
+            elif role == "user":
+                if text:
+                    parts.append(f"[User Request]:\n{text}")
+            elif role == "assistant":
+                if text:
+                    parts.append(f"[Assistant]:\n{text}")
+                for call in msg.get("tool_calls") or []:
+                    fn = call.get("function") or {}
+                    name = fn.get("name") or call.get("id") or "tool"
+                    args = fn.get("arguments", "")
+                    if not isinstance(args, str):
+                        args = json.dumps(args, ensure_ascii=False)
+                    parts.append(f"[Assistant Tool Call ({name})]:\n{args}")
+
+        return "\n\n".join(parts)
+
+    def _write_openai_error(
+        self,
+        writer: asyncio.StreamWriter,
+        status: int,
+        message: str,
+        err_type: str = "invalid_request_error",
+        code: Optional[str] = None,
+    ) -> None:
+        data = {
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": None,
+                "code": code,
+            }
+        }
+        self._write_json(writer, status, data)
+
     async def _route(self, method: str, path: str, body: bytes, writer: asyncio.StreamWriter) -> None:
+        if method == "OPTIONS":
+            self._write_json(writer, 200, {"ok": True})
+            return
+
         if method == "GET" and path == "/health":
             self._write_json(writer, 200, {
                 "ok": True,
@@ -476,19 +612,108 @@ class SimpleHttpServer:
             self._write_json(writer, 200, {
                 "tools": self.bridge.get_catalog()
             })
+        elif method == "GET" and path in ("/v1/models", "/models"):
+            self._write_json(writer, 200, {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "browser-chat",
+                        "object": "model",
+                        "created": 1700000000,
+                        "owned_by": "browser-ai",
+                        "permission": [],
+                        "root": "browser-chat",
+                        "parent": None,
+                    }
+                ],
+            })
+        elif method == "POST" and path in ("/v1/chat/completions", "/chat/completions"):
+            try:
+                data = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                self._write_openai_error(writer, 400, "Invalid JSON body", "invalid_request_error")
+                return
+            if not isinstance(data, dict):
+                self._write_openai_error(writer, 400, "JSON body must be an object", "invalid_request_error")
+                return
+
+            messages = data.get("messages", [])
+            if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
+                self._write_openai_error(writer, 400, "messages must be an array of objects", "invalid_request_error")
+                return
+            stream = bool(data.get("stream", False))
+            model = data.get("model", "browser-chat")
+
+            # Extract current latest input context (user message or tool results)
+            prompt_text = self._extract_prompt_text(messages)
+            if not prompt_text:
+                self._write_openai_error(writer, 400, "No prompt content found in messages", "invalid_request_error")
+                return
+
+            try:
+                timeout = float(data.get("timeout", 300))
+                if not 10 <= timeout <= 600:
+                    raise ValueError("timeout must be between 10 and 600 seconds")
+            except (TypeError, ValueError):
+                self._write_openai_error(writer, 400, "timeout must be numeric and between 10 and 600 seconds")
+                return
+            try:
+                reply = await self.bridge.send_remote_prompt(prompt_text, timeout=timeout)
+                created_ts = int(time.time())
+                cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+                if stream:
+                    await self._write_sse_chunks(writer, cmpl_id, model, reply, created_ts)
+                else:
+                    self._write_json(writer, 200, {
+                        "id": cmpl_id,
+                        "object": "chat.completion",
+                        "created": created_ts,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": reply,
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(prompt_text.split()),
+                            "completion_tokens": len(reply.split()),
+                            "total_tokens": len(prompt_text.split()) + len(reply.split()),
+                        },
+                    })
+            except Exception as e:
+                self._write_openai_error(writer, 500, str(e), "server_error")
         elif method == "POST" and path == "/prompt":
             try:
                 data = json.loads(body.decode("utf-8")) if body else {}
             except Exception:
                 self._write_json(writer, 400, {"error": "Invalid JSON body"})
                 return
+            if not isinstance(data, dict):
+                self._write_json(writer, 400, {"error": "JSON body must be an object"})
+                return
 
-            prompt_text = data.get("prompt", "").strip()
+            prompt = data.get("prompt", "")
+            if not isinstance(prompt, str):
+                self._write_json(writer, 400, {"error": "'prompt' field must be a string"})
+                return
+            prompt_text = prompt.strip()
             if not prompt_text:
                 self._write_json(writer, 400, {"error": "'prompt' field is required"})
                 return
 
-            timeout = float(data.get("timeout", 300))
+            try:
+                timeout = float(data.get("timeout", 300))
+                if not 10 <= timeout <= 600:
+                    raise ValueError("timeout must be between 10 and 600 seconds")
+            except (TypeError, ValueError):
+                self._write_json(writer, 400, {"error": "timeout must be numeric and between 10 and 600 seconds"})
+                return
             try:
                 reply = await self.bridge.send_remote_prompt(prompt_text, timeout=timeout)
                 self._write_json(writer, 200, {"ok": True, "reply": reply})
@@ -497,17 +722,66 @@ class SimpleHttpServer:
         else:
             self._write_json(writer, 404, {"error": f"Not found: {method} {path}"})
 
+    async def _write_sse_chunks(self, writer: asyncio.StreamWriter, cmpl_id: str, model: str, reply: str, created_ts: int) -> None:
+        try:
+            header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("utf-8")
+            writer.write(header)
+            await writer.drain()
+
+            # Chunk 1: Role
+            c1 = {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            writer.write(f"data: {json.dumps(c1, ensure_ascii=False)}\n\n".encode("utf-8"))
+            await writer.drain()
+
+            # Chunk 2: Content
+            c2 = {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": reply or ""}, "finish_reason": None}],
+            }
+            writer.write(f"data: {json.dumps(c2, ensure_ascii=False)}\n\n".encode("utf-8"))
+            await writer.drain()
+
+            # Chunk 3: Stop
+            c3 = {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            writer.write(f"data: {json.dumps(c3, ensure_ascii=False)}\n\n".encode("utf-8"))
+            writer.write(b"data: [DONE]\n\n")
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            pass
+
     def _write_json(self, writer: asyncio.StreamWriter, status: int, data: Dict[str, Any]) -> None:
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Error"}.get(status, "OK")
+        status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}.get(status, "OK")
         resp = (
             f"HTTP/1.1 {status} {status_text}\r\n"
             f"Content-Type: application/json; charset=utf-8\r\n"
             f"Content-Length: {len(payload)}\r\n"
-            f"Access-Control-Allow-Origin: *\r\n"
-            f"Connection: close\r\n\r\n"
+            "Connection: close\r\n\r\n"
         ).encode("utf-8") + payload
-        writer.write(resp)
+        try:
+            writer.write(resp)
+        except Exception:
+            pass
 
 
 async def main():

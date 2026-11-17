@@ -1,140 +1,83 @@
-# Pi Agent Connector
+# Pi Webchat Provider
 
-Jembatan dua arah (bidirectional bridge) antara **AI Chatbot Web** (Claude, ChatGPT, DeepSeek, Google Gemini, Grok, Kimi, Mistral, dll.) dengan **Pi Agent (Harness)** (`@mariozechner/pi-coding-agent`).
+A Pi Agent package that exposes a browser-hosted AI chat as a selectable model provider. It also connects supported browser chats to local tools through a localhost bridge.
 
-Proyek ini memungkinkan AI di browser menggunakan tool bawaan Pi Agent langsung di sistem Anda, sekaligus memungkinkan Anda (atau Pi Agent) mengirimkan prompt ke browser AI dari terminal.
+## Install
 
----
+Clone or download this repository, then install the local Pi package:
 
-## Fitur Utama
-
-1. **Toolset Asli Pi Agent (Harness)**:
-   - `bash`: Menjalankan perintah shell/bash di workspace.
-   - `read`: Membaca file dengan nomor baris, offset, dan limit.
-   - `write`: Menulis / membuat file lengkap.
-   - `edit`: Melakukan penggantian teks terarah secara presisi (`oldText` -> `newText`).
-   - `grep`: Pencarian regex di seluruh file workspace.
-   - `find`: Pencarian file berdasarkan pola glob.
-   - `ls`: Melihat daftar direktori dan ukuran file.
-
-2. **Prompting 2 Arah (Bidirectional)**:
-   - **Arah 1 (Browser ➔ Pi)**: Chatbot web memanggil tool Pi Agent di komputer Anda untuk memeriksa kode, menjalankan command, dan mengedit file.
-   - **Arah 2 (Pi ➔ Browser)**: Anda (atau Pi Agent CLI) dapat mengirimkan prompt dari terminal ke tab chatbot browser yang sedang terbuka via CLI `send_prompt.py` atau ekstensi Pi Agent (`/browser <prompt>`), lalu menerima jawaban AI langsung di terminal.
-
-3. **Multi-Provider Web**:
-   Mendukung Claude, ChatGPT, DeepSeek, Google Gemini, Grok, Kimi, GLM (Z.ai), Qwen, Meta AI, Mistral (Vibe Code), Ptero, dan Arena.
-
----
-
-## Arsitektur
-
-```text
-  [ Arah 1: Browser -> Pi ]
-  Browser (Claude / ChatGPT) ──▶ Tool Call (JSON) ──▶ Extension ──▶ WebSocket (17613) ──▶ Bridge ──▶ Pi Tools MCP
-                                                                                                        │
-  Browser (Claude / ChatGPT) ◀── Hasil Output ◀────── Extension ◀── WebSocket ◀────────── Bridge ◀─────┘
-
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────
-
-  [ Arah 2: Pi -> Browser ]
-  Terminal / Pi Agent CLI ──▶ HTTP POST (17614) ──▶ Bridge ──▶ WebSocket ──▶ Extension
-                                                                                │
-                                                                   (P.typeAndSend ketik ke chat web)
-                                                                                │
-                                                                                ▼
-  Terminal / Pi Agent CLI ◀── Jawaban Akhir ◀── HTTP ◀── Bridge ◀── WebSocket ◀─┘
+```bash
+git clone https://github.com/Nyuuk/pi-webchat-provider.git
+cd pi-webchat-provider
+pi install .
 ```
 
----
+`pi install .` registers the package for your personal Pi configuration. The package manifest points Pi to `pi-extension.ts`; it adds no npm dependencies because the provider uses Pi's built-in extension API.
 
-## Struktur Direktori
+To try it for one Pi invocation without adding it to settings:
 
-```text
-pi-agent-connector/
-├── extension/             # Browser Extension (Chrome/Edge Manifest V3)
-│   ├── manifest.json
-│   ├── background.js      # WebSocket client + remote prompt handler
-│   ├── overlay.css
-│   ├── popup.html / .js   # Status popup
-│   ├── core/              # System prompt, parser, & agentic loop
-│   └── providers/         # Adapter DOM untuk masing-masing web AI
-├── pi_tools_mcp.py        # MCP Server yang menyediakan 7 tool bawaan Pi Agent
-├── pi_bridge.py           # Local WebSocket (17613) & HTTP REST (17614) Server
-├── pi-extension.ts        # Ekstensi resmi untuk Pi Agent CLI (/browser command)
-├── send_prompt.py         # CLI pengirim prompt dari terminal Pi ke browser
-├── config.json            # Konfigurasi server MCP
-├── start.sh               # Launcher Linux / macOS
-└── start.bat              # Launcher Windows
+```bash
+pi -e .
 ```
 
----
+To remove the personal package later:
 
-## Panduan Pemasangan
+```bash
+pi remove /absolute/path/to/pi-webchat-provider
+```
 
-### 1. Pasang Extension di Browser (Chrome / Edge)
-1. Buka browser dan kunjungi `chrome://extensions` atau `edge://extensions`.
-2. Aktifkan **Developer mode** (di pojok kanan atas).
-3. Klik tombol **Load unpacked**.
-4. Pilih folder `extension/` dari repositori ini.
-5. Ikon **Pi Agent Connector** akan muncul di toolbar browser Anda.
+## Start the local bridge
 
-### 2. Jalankan Bridge di Komputer / Host
-Di terminal:
+The bridge needs Python 3 and the `websockets` package. The launcher does not install into system Python automatically. On Arch Linux:
+
+```bash
+sudo pacman -S python-websockets
+```
+
+On other systems, install `websockets` in the Python environment that will run the bridge. Then start it from the cloned directory:
+
 ```bash
 ./start.sh
 ```
-*(Atau `python3 pi_bridge.py`)*
 
-Bridge akan mendengarkan di:
-- WebSocket: `ws://127.0.0.1:17613` (koneksi extension)
-- HTTP API: `http://127.0.0.1:17614` (koneksi CLI / Pi Agent)
+Keep the bridge terminal open. It listens only on loopback:
 
----
+- WebSocket: `127.0.0.1:17613` — browser extension connection.
+- HTTP: `127.0.0.1:17614` — Pi model-provider requests.
 
-## Cara Penggunaan
+## Load the browser extension
 
-### Arah 1: Menggunakan Tool dari Browser
-1. Buka salah satu AI web chat yang didukung (misal: [Claude.ai](https://claude.ai) atau [ChatGPT](https://chatgpt.com)).
-2. Bar **Pi Agent** akan muncul di halaman chat.
-3. Klik **Start** pada bar tersebut.
-4. Tulis instruksi seperti biasa di chat web, contoh:
-   - *"Tolong cek isi direktori ini dan periksa apakah ada bug di main.py"*
-   - *"Jalankan perintah bash `git status` dan jelaskan perubahannya"*
-   - *"Edit file config.json untuk mengganti port menjadi 8080"*
-5. AI di browser akan otomatis memanggil tool Pi Agent, bridge mengeksekusinya di host Anda, dan hasilnya langsung diteruskan kembali ke chat.
+1. Open `chrome://extensions` (Chrome) or `edge://extensions` (Edge).
+2. Enable **Developer mode** and choose **Load unpacked**.
+3. Select the `extension/` directory inside this clone.
+4. Open a supported AI chat tab, sign in, and click **Start** in the Pi Agent Connector bar.
 
----
+The browser session must be initialized with **Start** before Pi sends a prompt to it. Requests are rejected if the chat is uninitialized or currently busy.
 
-### Arah 2: Mengirim Prompt dari Pi / Terminal ke Browser
+## Use the Browser AI model in Pi
 
-#### Menggunakan CLI `send_prompt.py`
-Anda bisa mengetikkan prompt dari terminal ke tab chat browser yang sedang aktif:
-```bash
-python3 send_prompt.py "Jelaskan arsitektur proyek ini secara singkat"
+After `pi install .`, restart Pi or reload extensions and select:
+
+```text
+/model browser/browser-chat
 ```
 
-Bisa juga menggunakan pipeline dari perintah shell:
+Or launch Pi with that model selected:
+
 ```bash
-git diff | python3 send_prompt.py "Tolong review perubahan kode berikut:"
+pi --model browser/browser-chat
 ```
 
-#### Menggunakan Ekstensi Pi Agent CLI (`pi-extension.ts`)
-Jika Anda menggunakan Pi Agent CLI (`@mariozechner/pi-coding-agent`), salin `pi-extension.ts`:
-```bash
-mkdir -p ~/.pi/agent/extensions
-cp pi-extension.ts ~/.pi/agent/extensions/browser-bridge.ts
-```
+Then type normal prompts in Pi. They are sent to the active supported browser chat; no `/browser` prefix is needed.
 
-Setelah itu, saat Anda menjalankan `pi` di terminal:
-- Ketik perintah:
-  ```text
-  /browser Tolong berikan ide solusi untuk error timeout pada database
-  ```
-  Prompt akan otomatis terkirim ke tab browser AI Anda, diproses di sana, dan hasilnya langsung tercetak di terminal Pi Anda.
-- Model di Pi Agent juga otomatis mendapatkan tool `ask_browser` sehingga Pi Agent bisa berkonsultasi ke model web AI saat mengerjakan task.
+## Browser-to-host tools
 
----
+With the browser session initialized, its AI can use the configured MCP tools (`bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`). File path tools are constrained to `PI_WORKSPACE_ROOT` (defaults to this package's directory). **`bash` runs with the host account's permissions and is not sandboxed to the workspace; commands are not individually confirmed.** Use only trusted AI accounts and review commands/results. Do not expose bridge ports to LAN or the internet.
 
-## Catatan Penting
-- Pastikan tab AI chat web tetap terbuka saat Anda mengirimkan remote prompt dari Pi.
-- Tidak ada unit test lokal yang dijalankan secara otomatis; seluruh alur dapat Anda uji langsung di lingkungan Anda.
+## Stop / remove
+
+- Stop the bridge with `Ctrl+C` in its terminal.
+- To uninstall the package from Pi: `pi remove /absolute/path/to/pi-webchat-provider`.
+- Disable or remove the unpacked extension from the browser's extension settings when no longer needed.
+
+Runtime/browser integration should be tested by the user after setup; the package has not been runtime-tested in this environment.

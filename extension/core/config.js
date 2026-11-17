@@ -49,12 +49,12 @@ const ZS = (() => {
       const objAlt = otherCmd ? "" : " (or ###...### block)";
       const notes = {
         malformed:
-          "ERROR: a snapgentV3 command was detected in your reply but its JSON could not be parsed. " +
+          "ERROR: a Pi Agent command was detected in your reply but its JSON could not be parsed. " +
           'Rewrite it as a single valid JSON object in plain text, exactly like {"command": "name", "params": {...}}' +
           luaMalformed + ". You may add a short note around it. " +
           "Please retry.",
         unclosed:
-          "ERROR: your snapgentV3 command was cut off before it finished - the JSON object" +
+          "ERROR: your Pi Agent command was cut off before it finished - the JSON object" +
           objAlt + " never closed, so it could not run. Rewrite the WHOLE command in one " +
           'piece as valid JSON, exactly like {"command": "name", "params": {...}}' +
           luaUnclosed + ". Please retry.",
@@ -83,7 +83,7 @@ const ZS = (() => {
         // detector and loop the error forever. Describe it, don't reproduce it.
         dsml:
           "ERROR: you wrote that call in your own internal tool-call markup (the DSML invoke/parameter " +
-          "tags). snapgentV3 cannot read that format, so the command did not run. Never use those tags " +
+          "tags). Pi Agent Connector cannot read that format, so the command did not run. Never use those tags " +
           "here. Write the call as a single plain-text JSON object instead, exactly like " +
           '{"command": "name", "params": { ...your parameters... }} - one command per reply. ' +
           "Please retry.",
@@ -100,30 +100,26 @@ const ZS = (() => {
       valid.join(", ") +
       ". Use an exact name and parameter keys from the system prompt.",
     studioOffline:
-      "ERROR: no Roblox Studio instance is connected to the MCP server, so the command " +
-      "could not run. Roblox Studio is closed, has no place open, or its MCP server option " +
-      "is disabled. This is an environment problem on the user's machine, NOT your mistake. " +
-      "Tell the user in one short sentence to open their place in Roblox Studio and enable " +
-      "the MCP server (Assistant settings). Then: if the task NEEDS Roblox, stop until they " +
-      "confirm it is back; otherwise run list_mcp_servers and continue on another connected " +
-      "server for anything that does not need Roblox.",
+      "ERROR: no target instance is connected to the MCP server, so the command " +
+      "could not run. This is an environment problem on the user's machine, NOT your mistake. " +
+      "Tell the user in one short sentence to ensure the bridge and target are running. " +
+      "Then run list_mcp_servers and continue on another connected server.",
     // The page outlived the extension build it was running (reload / auto-update
     // / disable+enable). Nothing here can recover it - only a page reload can -
     // so the model must NOT be told the bridge is down and must NOT retry, or it
     // burns the whole conversation re-issuing commands that can never run. See
     // isContextInvalidated in core/main.js.
     staleExtension:
-      "ERROR: the snapgentV3 extension was reloaded or updated while this page was open, so this " +
+      "ERROR: the Pi Agent Connector extension was reloaded or updated while this page was open, so this " +
       "tab is running a version of it that no longer exists and NO command can reach the user's " +
-      "machine from here. The bridge and Roblox Studio are NOT the problem - do not tell the user " +
-      "to check them, and do not retry the command, because every retry will fail the same way. " +
+      "machine from here. The bridge is NOT the problem - do not tell the user " +
+      "to check it, and do not retry the command, because every retry will fail the same way. " +
       "Tell the user in one short sentence to RELOAD THIS PAGE (F5), then stop and wait.",
     bridgeOffline:
-      "ERROR: the local snapgentV3 bridge is unreachable, so no command could run. " +
+      "ERROR: the local Pi Agent bridge is unreachable, so no command could run. " +
       "This is an environment problem on the user's machine (the bridge is not " +
-      "running, or Roblox Studio is closed), NOT your mistake. Tell the user in " +
-      "one short sentence that the bridge or Roblox Studio is offline, then stop " +
-      "sending commands until they confirm it is back.",
+      "running), NOT your mistake. Tell the user in one short sentence that the bridge " +
+      "is offline, then stop sending commands until they confirm it is back.",
     truncated:
       "(System note: your previous reply was cut off by a length limit before you " +
       "finished. Continue from exactly where you stopped. Do NOT restart and do " +
@@ -179,13 +175,13 @@ The connected target is ${targetName} (server id: ${targetServer}).
 The extension intercepts your commands, runs them directly on the user's host machine via Pi Agent tools, and returns the outputs back as the next turn. Your built-in web sandbox tools do not reach the user's system; Pi Agent commands DO.
 
 ━━━ AVAILABLE PI AGENT TOOLS ━━━
-- bash(command, timeout?): Execute bash commands in the workspace.
-- read(path, offset?, limit?): Read file contents with line numbers.
-- write(path, content): Create or overwrite a file with full content.
-- edit(path, edits: [{oldText, newText}]): Apply exact targeted replacements in a file.
-- grep(pattern, path?, glob?): Search regex patterns across workspace files.
-- find(pattern, path?): Find files matching a glob pattern.
-- ls(path?): List directory contents with types and sizes.
+- bash(command, timeout?): Execute bash with the host account's permissions (starting in the workspace; not sandboxed to it).
+- read(path, offset?, limit?): Read file contents with line numbers; paths are restricted to the workspace.
+- write(path, content): Create or overwrite a file with full content; paths are restricted to the workspace.
+- edit(path, edits: [{oldText, newText}]): Apply exact targeted replacements; paths are restricted to the workspace.
+- grep(pattern, path?, glob?): Search regex patterns within the workspace.
+- find(pattern, path?): Find files matching a glob pattern within the workspace.
+- ls(path?): List workspace directory contents with types and sizes.
 
 ━━━ COMMAND FORMAT (MANDATORY) ━━━
 Write exactly ONE command per reply as a fenced JSON block:
@@ -302,14 +298,14 @@ Rules:
   // A short, clearly-labelled reminder of the available commands, injected under
   // a tool result every so often so the model does not drift from the exact
   // command names over a long session. It is explicitly framed as an automatic
-  // snapgentV3 reminder (NOT a user message and NOT a new command to run).
-  function toolsReminder(tools, targetName = "VS Code", serverId = "vscode") {
+  // Pi Agent Connector reminder (NOT a user message and NOT a new command to run).
+  function toolsReminder(tools, targetName = "Pi Agent", serverId = "pi-agent") {
     const toolsString =
       `  list_commands(server: "${serverId}") - list available ${targetName} commands with full parameter details\n` +
       compactTools(tools);
     return (
       "\n\n────────────────────────────────\n" +
-      "(System note from snapgentV3 - this is an automatic REMINDER, not a request and not a new result. " +
+      "(System note from Pi Agent Connector - this is an automatic REMINDER, not a request and not a new result. " +
       "Do NOT reply to it or run any command because of it; just keep it in mind for your next command.)\n" +
       `Reminder of the ${targetName} commands (use exact names and parameter keys; ` +
       "only this selected target is available in this session):\n" +
@@ -322,9 +318,8 @@ Rules:
   // optional reminder, NOT a command to run right now.
   function memoryNudge() {
     return (
-      "(Reminder: if you've learned anything DURABLE about this project since your last memory update " +
-      "(architecture, where things live, conventions, decisions, user preferences), update your shared project memory at " +
-      "game.ServerStorage.snapgentV3.Memory with multi_edit - only useful, lasting facts. If nothing changed, ignore this.)"
+      "(Reminder: if you've learned anything DURABLE about this project since your last update " +
+      "(architecture, where things live, conventions, decisions, user preferences), keep it in mind. If nothing changed, ignore this.)"
     );
   }
 
