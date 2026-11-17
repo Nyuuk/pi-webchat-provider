@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// core/config.js - provider-agnostic constants: app identity, system prompt,
+// feedback strings, tool categorisation. NOTHING in this file may reference a
+// specific AI site (DOM, selectors, site names) - that lives in providers/*.
+// eslint-disable-next-line no-unused-vars
+const ZS = (() => {
+  "use strict";
+
+  // Display name + unique marker injected at the top of the system prompt so the
+  // content script can reliably recognise (and camouflage) the bootstrap turn.
+  const APP_NAME = "Pi Agent Connector";
+  const SYS_MARKER = "⟦PI-SYS⟧";
+  // A re-statement of the system prompt mid-session (see withSysResend in
+  // core/main.js). It carries SYS_MARKER TOO - that is what drives camouflage
+  // and session detection, and neither should change - plus this second marker,
+  // purely so the chip can say "Reminder" instead of inheriting the bootstrap's
+  // "Starting Up". Same content, different label: a re-injection is not a start.
+  const RESEND_MARKER = "⟦PI-RE⟧";
+
+  // ── Tool → visual category (icon + colour theme for the chips) ─────────
+  // Returns one of: read | edit | screen | bash | tool
+  function toolCategory(name) {
+    const n = (name || "").includes("/") ? name.split("/").pop() : (name || "");
+    if (n === "list_commands" || n === "list_tools") return "read";
+    if (/^(read|grep|find|ls|script_read|search|inspect)$/.test(n)) return "read";
+    if (/^(write|edit|patch|create|update)$/.test(n)) return "edit";
+    if (n === "bash" || n === "terminal") return "edit";
+    if (n === "screen_capture") return "screen";
+    return "tool";
+  }
+
+  // Feedback strings sent back to the model so it can self-correct.
+  const FEEDBACK = {
+    // A command-shaped reply that could not be turned into a runnable call.
+    // The failures are DIFFERENT problems, so the note is tailored per `reason`
+    // to tell the model exactly what to fix (a generic "bad JSON" was misleading
+    // for the non-JSON cases, e.g. a missing ###LUA### opener). Falls back to the
+    // generic "malformed" text for any unrecognised reason.
+    parseError: (reason, toolName) => {
+      // ###LUA### is execute_luau-ONLY (the parser always maps a bare ###LUA###
+      // block to execute_luau). So only suggest it when the broken command IS
+      // execute_luau, or when we could not tell which command it was. For a KNOWN
+      // other command (e.g. execute_blender_code) the ###LUA### hint is wrong and
+      // misleading - a model that followed it would ship its code to the wrong MCP
+      // - so drop it and keep the JSON-only guidance.
+      const otherCmd = toolName && toolName !== "command" && toolName !== "execute_luau";
+      const luaMalformed = otherCmd ? "" : " (or use the ###LUA### / ###END_LUA### block for execute_luau)";
+      const luaUnclosed = otherCmd ? "" : " (or a complete ###LUA### ... ###END_LUA### block for execute_luau)";
+      const objAlt = otherCmd ? "" : " (or ###...### block)";
+      const notes = {
+        malformed:
+          "ERROR: a snapgentV3 command was detected in your reply but its JSON could not be parsed. " +
+          'Rewrite it as a single valid JSON object in plain text, exactly like {"command": "name", "params": {...}}' +
+          luaMalformed + ". You may add a short note around it. " +
+          "Please retry.",
+        unclosed:
+          "ERROR: your snapgentV3 command was cut off before it finished - the JSON object" +
+          objAlt + " never closed, so it could not run. Rewrite the WHOLE command in one " +
+          'piece as valid JSON, exactly like {"command": "name", "params": {...}}' +
+          luaUnclosed + ". Please retry.",
+        luaOpener:
+          "ERROR: you wrote the closing ###END_LUA### marker but not the opening ###LUA### marker, " +
+          "so the Luau block was not detected and did not run. Put ###LUA### immediately BEFORE your " +
+          "code and ###END_LUA### after it. Please retry.",
+        envelope:
+          "ERROR: you wrote a command's parameters as a bare JSON object, but without the required " +
+          "envelope, so it was not recognised as a command. Wrap them like " +
+          '{"command": "name", "params": { ...your parameters... }} - the parameter keys go INSIDE ' +
+          '"params". Please retry.',
+        // The model named a REAL tool but under the wrong key - it wrote the call
+        // the way a function-calling API would (e.g. {"toolName": "get_studio_state",
+        // "studio_id": "..."}) instead of snapgentV3's envelope. Seen live on
+        // ChatGPT in a long session. Naming the wrong keys explicitly matters: a
+        // generic "bad JSON" note made the model rewrite the SAME shape.
+        toolKey:
+          "ERROR: you used the wrong key to name the command, so it was not recognised and did not " +
+          'run. The key must be exactly "command" - not "toolName", "tool", "name", "function" or ' +
+          '"action" - and every argument goes INSIDE "params", like ' +
+          '{"command": "name", "params": { ...your parameters... }}. Please retry.',
+        // DeepSeek sometimes falls back to its own native agentic markup. The
+        // note must NEVER quote the markers literally: the reply that follows
+        // often echoes the wording, and a quoted marker would re-trigger the
+        // detector and loop the error forever. Describe it, don't reproduce it.
+        dsml:
+          "ERROR: you wrote that call in your own internal tool-call markup (the DSML invoke/parameter " +
+          "tags). snapgentV3 cannot read that format, so the command did not run. Never use those tags " +
+          "here. Write the call as a single plain-text JSON object instead, exactly like " +
+          '{"command": "name", "params": { ...your parameters... }} - one command per reply. ' +
+          "Please retry.",
+      };
+      return notes[reason] || notes.malformed;
+    },
+    multiTool: (names) =>
+      "ERROR: You wrote multiple commands in one reply. Write ONE command at a " +
+      "time and wait for its result before the next. You tried: " +
+      names.join(", ") +
+      ". Start over and write only the first command you need.",
+    unknownTool: (name, valid) =>
+      `ERROR: unknown command "${name}". It does not exist. Valid commands are: ` +
+      valid.join(", ") +
+      ". Use an exact name and parameter keys from the system prompt.",
+    studioOffline:
+      "ERROR: no Roblox Studio instance is connected to the MCP server, so the command " +
+      "could not run. Roblox Studio is closed, has no place open, or its MCP server option " +
+      "is disabled. This is an environment problem on the user's machine, NOT your mistake. " +
+      "Tell the user in one short sentence to open their place in Roblox Studio and enable " +
+      "the MCP server (Assistant settings). Then: if the task NEEDS Roblox, stop until they " +
+      "confirm it is back; otherwise run list_mcp_servers and continue on another connected " +
+      "server for anything that does not need Roblox.",
+    // The page outlived the extension build it was running (reload / auto-update
+    // / disable+enable). Nothing here can recover it - only a page reload can -
+    // so the model must NOT be told the bridge is down and must NOT retry, or it
+    // burns the whole conversation re-issuing commands that can never run. See
+    // isContextInvalidated in core/main.js.
+    staleExtension:
+      "ERROR: the snapgentV3 extension was reloaded or updated while this page was open, so this " +
+      "tab is running a version of it that no longer exists and NO command can reach the user's " +
+      "machine from here. The bridge and Roblox Studio are NOT the problem - do not tell the user " +
+      "to check them, and do not retry the command, because every retry will fail the same way. " +
+      "Tell the user in one short sentence to RELOAD THIS PAGE (F5), then stop and wait.",
+    bridgeOffline:
+      "ERROR: the local snapgentV3 bridge is unreachable, so no command could run. " +
+      "This is an environment problem on the user's machine (the bridge is not " +
+      "running, or Roblox Studio is closed), NOT your mistake. Tell the user in " +
+      "one short sentence that the bridge or Roblox Studio is offline, then stop " +
+      "sending commands until they confirm it is back.",
+    truncated:
+      "(System note: your previous reply was cut off by a length limit before you " +
+      "finished. Continue from exactly where you stopped. Do NOT restart and do " +
+      "NOT repeat what you already wrote.)",
+  };
+
+  const BT = "```";
+
+  function compactTools(tools) {
+    return (tools || [])
+      .map((t) => {
+        const name = t.name || "?";
+        const desc = (t.description || "").split("\n")[0].trim();
+        const props = (t.inputSchema && t.inputSchema.properties) || {};
+        const args = Object.keys(props).join(", ");
+        return `  ${name}(${args}) - ${desc}`;
+      })
+      .join("\n");
+  }
+
+  // ── System prompt ─────────────────────────────────────────────────────────
+  // ONE unified prompt sent to every AI on the first turn. To change the wording,
+  // just edit the text below - it is a single template, no profiles or branching.
+  // `${siteName}` is filled in with the AI's display name (e.g. "DeepSeek").
+  // `${toolsString}` is filled in with the live command list.
+  //
+  // `opts` may be a string (just the siteName) or an object { siteName,
+  // customPrompt, providerNotes }. `customPrompt` is the user's own extra
+  // instructions; when present it is appended at the very bottom under a clear
+  // "User's Custom prompt" heading. It NEVER edits the prompt above - it only
+  // adds a layer below it.
+  //
+  // `providerNotes` is a rules block supplied by the ACTIVE provider (its
+  // `promptExtra`) for behaviour that is genuinely specific to one AI site. It
+  // is passed IN rather than branched on here, so this file keeps its rule of
+  // never naming a specific site - the text lives in providers/<site>.js and
+  // every other provider is untouched by definition.
+  function buildSystemPrompt(opts = {}) {
+    if (typeof opts === "string") opts = { siteName: opts };
+    const {
+      siteName = "this AI site",
+      customPrompt = "",
+      providerNotes = "",
+      targetServer = "pi-agent",
+      targetName = "Pi Agent",
+      skills = [],
+      antislopRules = "",
+    } = opts;
+
+    const prompt = `CONTEXT: Pi Agent Connector connects your replies to the user's local Pi Agent (harness) through a local bridge.
+The connected target is ${targetName} (server id: ${targetServer}).
+
+The extension intercepts your commands, runs them directly on the user's host machine via Pi Agent tools, and returns the outputs back as the next turn. Your built-in web sandbox tools do not reach the user's system; Pi Agent commands DO.
+
+━━━ AVAILABLE PI AGENT TOOLS ━━━
+- bash(command, timeout?): Execute bash commands in the workspace.
+- read(path, offset?, limit?): Read file contents with line numbers.
+- write(path, content): Create or overwrite a file with full content.
+- edit(path, edits: [{oldText, newText}]): Apply exact targeted replacements in a file.
+- grep(pattern, path?, glob?): Search regex patterns across workspace files.
+- find(pattern, path?): Find files matching a glob pattern.
+- ls(path?): List directory contents with types and sizes.
+
+━━━ COMMAND FORMAT (MANDATORY) ━━━
+Write exactly ONE command per reply as a fenced JSON block:
+\`\`\`json
+{"command": "exact_tool_name", "params": {"key": "value"}}
+\`\`\`
+
+Examples:
+\`\`\`json
+{"command": "read", "params": {"path": "package.json"}}
+\`\`\`
+\`\`\`json
+{"command": "bash", "params": {"command": "git status --short"}}
+\`\`\`
+\`\`\`json
+{"command": "edit", "params": {"path": "src/app.ts", "edits": [{"oldText": "const x = 1;", "newText": "const x = 2;"}]}}
+\`\`\`
+
+Rules:
+- ONE command per turn. Wait for the tool result before emitting the next command.
+- Put every command inside a fenced code block (\`\`\`json ... \`\`\`).
+- If you need to explore or verify files, start by calling 'ls', 'find', or 'grep'.
+- On errors, inspect the error output and adjust your next call accordingly.
+- When the task is complete, summarize your work briefly in plain text without further tool calls.
+- You are ${siteName}; Pi Agent Connector executes the tools on the user's machine.`;
+
+    const skillsBlock = Array.isArray(skills) && skills.length
+      ? "\n\nAvailable skills:\n" +
+        skills.map((s) => `- ${s.name}: ${s.description} (path: ${s.path || ".pi/skills/" + s.name + "/SKILL.md"})`).join("\n")
+      : "";
+
+    const siteRules = providerNotes.trim()
+      ? `\n\n━━━ ADDITIONAL RULES FOR THIS SITE ━━━\n${providerNotes.trim()}`
+      : "";
+
+    const extra = customPrompt.trim()
+      ? `\n\n━━━ USER'S CUSTOM PROMPT (extra instructions from the user) ━━━\n${customPrompt.trim()}`
+      : "";
+
+    return `${SYS_MARKER}\n${prompt}${skillsBlock}${antislopRules ? "\n\nWriting rules:\n" + antislopRules : ""}${siteRules}${extra}`;
+  }
+
+  // ── Curated, TESTED usage notes per command ─────────────────────────────────
+  // The MCP's own schema descriptions are thin, and the model makes the same
+  // mistakes repeatedly. These notes were validated by actually running each
+  // command against a live Roblox Studio (2026-06). Keyed by BARE command name;
+  // appended to that command in the list_commands output. Keep each note tight
+  // and concrete - it costs context on every reminder.
+  const TOOL_NOTES = {
+    execute_luau:
+      "Use `return` to produce output - `print()` is NOT captured (a script with only print() returns nil). " +
+      "Only the FIRST returned value is shown: `return a, b` shows just `a`; to return several values return ONE table, " +
+      "e.g. `return {ok=true, n=3}` (tables come back as JSON). " +
+      "Runs synchronously with a ~20s budget: a brief `task.wait(1)` is fine, but anything that can block or never resolve will TIME OUT. " +
+      "ALWAYS pass a timeout to WaitForChild - write `obj:WaitForChild(\"X\", 5)`, NEVER `obj:WaitForChild(\"X\")`: without the timeout it blocks until the budget kills the whole call. " +
+      "Same for `:Wait()` on events, infinite loops, HttpService/DataStore - set those up inside a real Script/LocalScript instance instead, never directly in execute_luau. " +
+      "Property types must match exactly (e.g. Position needs Vector3.new(...), not a string). " +
+      "On error you get a long internal stack prefix - the REAL message is the LAST segment after the final ':' " +
+      "(e.g. '... : Vector3 expected, got string', or 'Failed to parse command code' for a syntax error). " +
+      "Create objects with Instance.new and set .Parent; reach services via game:GetService(\"Name\").",
+    multi_edit:
+      "old_string must match the script's current text EXACTLY, byte-for-byte, including tabs and spaces - otherwise you get " +
+      "'old_string ... not found in current content'. ALWAYS script_read the file FIRST and copy the exact text. " +
+      "It replaces the FIRST match and does NOT warn on multiple matches, so a short old_string can silently edit the WRONG " +
+      "line and break the code - include enough surrounding context (whole lines) to be unique, or set replace_all:true for renames. " +
+      "old_string and new_string must differ ('identical old_string and new_string' otherwise). " +
+      "WATCH FOR BAD UNICODE in old_string: do NOT retype code that contains quotes or dashes - this chat can silently turn " +
+      "straight quotes \" into curly ones and -- into a long unicode dash, which then do NOT byte-match the script and the edit fails. " +
+      "Paste old_string verbatim from script_read. (new_string may contain unicode safely - it is written as-is.) " +
+      "Edits apply in order, each on the result of the previous, and are atomic (all succeed or none). " +
+      "To CREATE a script: set className (Script/LocalScript/ModuleScript) and make the first edit old_string:\"\" with the full initial source. " +
+      "datamodel_type must be \"Edit\".",
+    inspect_instance:
+      "Path is dot-notation and case-insensitive, e.g. 'Workspace.Model.Part'. Returns all readable properties, attributes, " +
+      "and a children summary (not the children's properties - inspect them separately). If several instances share the path, " +
+      "up to 20 matches are returned. Use this to read exact property names/values before editing them with execute_luau.",
+    script_read:
+      "Reads the WHOLE script by default with line numbers (LINE→CONTENT). Use it before multi_edit so your old_string " +
+      "matches exactly. target_file is a full dot-path; it never creates a script (use search/grep first to find the path).",
+    user_keyboard_input:
+      "Simulates a real player typing during PLAY. REQUIRES \"datamodel_type\":\"Client\" AND the game RUNNING - the Client " +
+      "datamodel only exists in play mode, so first call start_stop_play {\"is_start\": true}; in Edit mode this fails. " +
+      "(snapgentV3 auto-fills datamodel_type:\"Client\" if you omit it, but the game must still be running.) " +
+      "\"actions\" is an ORDERED array of OBJECTS - each step MUST be {\"action\": ...}, NOT a bare string (a missing/misnamed action " +
+      "gives 'Unknown ... action: nil'). action is one of: keyDown | keyUp | keyPress (down+up) | textInput | wait. " +
+      "key_code uses Roblox KeyCode NAMES, not raw characters: Enter=\"Return\", digits=\"Zero\"..\"Nine\", letters=single uppercase " +
+      "\"A\"..\"Z\", plus \"Space\", \"Backspace\", \"Tab\", arrows \"Up\"/\"Down\"/\"Left\"/\"Right\", modifiers \"LeftShift\"/\"LeftControl\"/\"LeftAlt\" " +
+      "- REQUIRED on keyDown/keyUp/keyPress ('key_code is required' otherwise). To type a whole string use ONE textInput step with " +
+      "\"text_inputs\":\"hello\" instead of many keyPress. A \"wait\" step MUST carry \"wait_time_ms\" (0-10000) ('wait_time_ms is required " +
+      "for wait action' otherwise). Optional \"instance_path\" routes input to a focused GUI element and must start with game, LocalPlayer " +
+      "or Workspace (e.g. \"LocalPlayer.PlayerGui.Menu.NameBox\"); omit it to send to whatever currently has focus. " +
+      "Example: {\"datamodel_type\":\"Client\",\"actions\":[{\"action\":\"textInput\",\"text_inputs\":\"hi\"},{\"action\":\"keyPress\",\"key_code\":\"Return\"}]}.",
+    generate_mesh:
+      "Unlike generate_procedural_model, this call YIELDS: it blocks until the AI mesh generation finishes and only then " +
+      "returns the result (the finished mesh) - there is no separate poll/wait step needed, just wait for the response.",
+    generate_procedural_model:
+      "Unlike generate_mesh, this call does NOT yield: it returns immediately with a generationId while the model builds " +
+      "in the background and auto-inserts into the workspace once done - do NOT run other commands assuming the model already " +
+      "exists yet. Do NOT call wait_job_finished as a reflex right after this - but DO call it (pass the generationId) whenever " +
+      "you actually need the finished result before continuing: either the user explicitly asked to wait, or your next step " +
+      "depends on the model being done (e.g. editing/coloring it, checking its geometry).",
+    user_mouse_input:
+      "Simulates real player mouse actions during PLAY. Same requirement as user_keyboard_input: \"datamodel_type\":\"Client\" (auto-filled " +
+      "if omitted) AND the game RUNNING (start_stop_play {\"is_start\": true} first; fails in Edit mode). " +
+      "\"actions\" is an ORDERED array of OBJECTS - each step MUST be {\"action\": ...}, NOT a bare string (a missing/misnamed action gives " +
+      "'Unknown mouse action: nil'). action is one of: moveTo | mouseButtonDown | mouseButtonUp | mouseButtonClick | scrollUp | scrollDown | wait. " +
+      "You MUST establish a position BEFORE any click/scroll: the FIRST step needs \"x\"/\"y\" (screen pixels) OR \"instance_path\" " +
+      "(starts with game/LocalPlayer/Workspace; if set, x/y are ignored) - else 'Either x and y, instance_path, or a prior action ... is " +
+      "required'. Later steps may omit x/y and reuse the last position (click then scroll at the same spot). " +
+      "mouseButtonDown/Up/Click need \"mouse_button\":\"left\" or \"right\". A \"wait\" step needs \"wait_time_ms\" (0-10000). " +
+      "Example: {\"datamodel_type\":\"Client\",\"actions\":[{\"action\":\"mouseButtonClick\",\"mouse_button\":\"left\",\"instance_path\":\"LocalPlayer.PlayerGui.Menu.PlayBtn\"}]}.",
+  };
+
+  // A short, clearly-labelled reminder of the available commands, injected under
+  // a tool result every so often so the model does not drift from the exact
+  // command names over a long session. It is explicitly framed as an automatic
+  // snapgentV3 reminder (NOT a user message and NOT a new command to run).
+  function toolsReminder(tools, targetName = "VS Code", serverId = "vscode") {
+    const toolsString =
+      `  list_commands(server: "${serverId}") - list available ${targetName} commands with full parameter details\n` +
+      compactTools(tools);
+    return (
+      "\n\n────────────────────────────────\n" +
+      "(System note from snapgentV3 - this is an automatic REMINDER, not a request and not a new result. " +
+      "Do NOT reply to it or run any command because of it; just keep it in mind for your next command.)\n" +
+      `Reminder of the ${targetName} commands (use exact names and parameter keys; ` +
+      "only this selected target is available in this session):\n" +
+      toolsString
+    );
+  }
+
+  // One-line memory nudge, appended to the periodic reminder, so the model keeps
+  // its project memory current without us forcing a write. Clearly framed as an
+  // optional reminder, NOT a command to run right now.
+  function memoryNudge() {
+    return (
+      "(Reminder: if you've learned anything DURABLE about this project since your last memory update " +
+      "(architecture, where things live, conventions, decisions, user preferences), update your shared project memory at " +
+      "game.ServerStorage.snapgentV3.Memory with multi_edit - only useful, lasting facts. If nothing changed, ignore this.)"
+    );
+  }
+
+  return {
+    APP_NAME,
+    SYS_MARKER,
+    RESEND_MARKER,
+    FEEDBACK,
+    toolCategory,
+    buildSystemPrompt,
+    compactTools,
+    toolsReminder,
+    memoryNudge,
+    TOOL_NOTES,
+  };
+})();
